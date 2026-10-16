@@ -138,3 +138,19 @@ export function toBraceQL(db: DB): string {
   }
   return out.join("\n");
 }
+
+// Validate + normalise database JSON (used by Import and Edit JSON).
+export function parseDb(text: string, fallbackName: string): DB {
+  const d = JSON.parse(text);
+  if (!d || typeof d.tables !== "object" || d.tables === null || Array.isArray(d.tables)) {
+    throw new Error('JSON must contain a "tables" object');
+  }
+  const tables: DB["tables"] = {};
+  for (const [name, t] of Object.entries(d.tables as Record<string, { columns?: unknown; rows?: unknown }>)) {
+    if (!t || !Array.isArray(t.rows)) throw new Error(`Table "${name}" needs a "rows" array`);
+    const rows = t.rows as Row[];
+    const columns = Array.isArray(t.columns) ? (t.columns as string[]) : Array.from(new Set(rows.flatMap((r) => Object.keys(r))));
+    tables[name] = { columns, rows };
+  }
+  return { name: typeof d.name === "string" && d.name ? d.name : fallbackName, tables };
+}

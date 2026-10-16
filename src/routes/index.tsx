@@ -2,7 +2,7 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import type { Session } from "@supabase/supabase-js";
 import { supabase } from "@/integrations/supabase/client";
-import { execute, splitStatements, toBraceQL, type DB, type Result } from "@/lib/braceql";
+import { execute, splitStatements, toBraceQL, parseDb, type DB, type Result } from "@/lib/braceql";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -44,6 +44,10 @@ function Index() {
   const [showConnect, setShowConnect] = useState(false);
   const [files, setFiles] = useState<FileItem[]>([]);
   const [status, setStatus] = useState<SaveStatus>("idle");
+  const [fileError, setFileError] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [jsonErr, setJsonErr] = useState("");
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const queryRef = useRef(query);
   const dbRef = useRef(db);
@@ -109,7 +113,8 @@ function Index() {
     const blob = new Blob([JSON.stringify(d, null, 2)], { type: "application/json" });
     await supabase.storage.from(BUCKET).remove([path]);
     const { error } = await supabase.storage.from(BUCKET).upload(path, blob, { contentType: "application/json" });
-    if (!error) loadFiles();
+    setFileError(error ? error.message : "");
+    loadFiles();
   };
   const syncJsonSoon = (d: DB) => {
     if (jsonTimer.current) clearTimeout(jsonTimer.current);
@@ -122,7 +127,8 @@ function Index() {
     if (!currentId) return;
     const data = { tables: d.tables, query: queryRef.current };
     setCloudDbs((l) => l.map((x) => (x.id === currentId ? { ...x, name: d.name, data } : x)));
-    await supabase.from("databases").update({ name: d.name, data, updated_at: new Date().toISOString() }).eq("id", currentId);
+    const { error } = await supabase.from("databases").update({ name: d.name, data, updated_at: new Date().toISOString() }).eq("id", currentId);
+    if (error) setResults([{ stmt: "save", res: { ok: false, message: error.message } }]);
     syncJsonSoon(d);
   };
 
@@ -204,6 +210,7 @@ function Index() {
     for (const f of Array.from(list)) {
       const name = f.name.replace(/[^\w.\-]/g, "_");
       const { error } = await supabase.storage.from(BUCKET).upload(`${currentId}/${name}`, f, { upsert: true });
+      setFileError(error ? error.message : "");
       if (error) setResults([{ stmt: f.name, res: { ok: false, message: error.message } }]);
     }
     loadFiles();
@@ -236,16 +243,27 @@ function Index() {
 
   const importFile = async (f: File) => {
     try {
-      const d = JSON.parse(await f.text());
-      if (!d.tables) throw new Error();
-      const nd: DB = { name: d.name ?? db.name, tables: d.tables };
+      const nd = parseDb(await f.text(), db.name);
       await save(nd);
       onQueryChange(toBraceQL(nd)); // show the generated BraceQL in the editor
       setResults([{ stmt: f.name, res: { ok: true, message: "Imported — BraceQL generated in the editor" } }]);
-    } catch {
-      setResults([{ stmt: f.name, res: { ok: false, message: "Invalid database JSON file" } }]);
+    } catch (e) {
+      setResults([{ stmt: f.name, res: { ok: false, message: e instanceof Error ? `Invalid database JSON: ${e.message}` : "Invalid database JSON file" } }]);
     }
   };
+
+  const closeJson = () => { setShowJson(false); setEditing(false); setJsonErr(""); };
+  const applyJson = async () => {
+    try {
+      const nd = parseDb(draft, db.name);
+      await save(nd);
+      setEditing(false); setJsonErr("");
+      setResults([{ stmt: "Edit JSON", res: { ok: true, message: "JSON saved" } }]);
+    } catch (e) {
+      setJsonErr(e instanceof Error ? e.message : "Invalid JSON");
+    }
+  };
+  const jsonName = `${db.name.replace(/[^\w.\-]/g, "_") || "database"}.json`;
 
   const apiUrl = typeof window !== "undefined" && current ? `${window.location.origin}/api/public/db/${current.id}` : "";
 
@@ -370,10 +388,16 @@ function Index() {
                 <button className="text-xs text-primary" onClick={() => uploadRef.current?.click()}>+ Upload</button>
                 <input ref={uploadRef} type="file" multiple hidden onChange={(e) => e.target.files && uploadFiles(e.target.files)} />
               </div>
-              {files.length === 0 && <p className="text-sm text-muted-foreground">No files</p>}
+              {fileError && <p className="text-xs text-destructive mb-2 break-words">File storage error: {fileError}. Run supabase/storage-setup.sql in the Supabase SQL editor.</p>}
+              {!files.some((f) => f.name === jsonName) && (
+                <div className="flex justify-between items-center text-sm py-1 gap-2">
+                  <button className="truncate hover:text-primary text-left" onClick={() => setShowJson(true)}>{jsonName}</button>
+                  <span className="text-xs text-muted-foreground">live</span>
+                </div>
+              )}
               {files.map((f) => (
                 <div key={f.name} className="flex justify-between items-center text-sm py-1 gap-2">
-                  <button className="truncate hover:text-primary text-left" onClick={() => openFile(f.name)}>{f.name}</button>
+                  <button className="truncate hover:text-primary text-left" onClick={() => (f.name === jsonName ? setShowJson(true) : openFile(f.name))}>{f.name}</button>
                   <button className="text-xs text-destructive" onClick={() => removeFile(f.name)}>✕</button>
                 </div>
               ))}
@@ -396,9 +420,18 @@ function Index() {
       </main>
 
       {showJson && (
-        <Modal onClose={() => setShowJson(false)} title={`${db.name}.json`}
-          actions={<><button className="btn-ghost" onClick={() => navigator.clipboard.writeText(json)}>Copy</button><button className="btn-primary" onClick={download}>Download</button></>}>
-          <pre className="overflow-auto p-4 text-xs text-primary">{json}</pre>
+        <Modal onClose={closeJson} title={`${db.name}.json`}
+          actions={editing
+            ? <><button className="btn-ghost" onClick={() => { setEditing(false); setJsonErr(""); }}>Cancel</button><button className="btn-primary" onClick={applyJson}>Apply &amp; save</button></>
+            : <><button className="btn-ghost" onClick={() => navigator.clipboard.writeText(json)}>Copy</button><button className="btn-ghost" onClick={() => { setDraft(json); setEditing(true); }}>Edit</button><button className="btn-primary" onClick={download}>Download</button></>}>
+          {editing ? (
+            <div className="p-4 space-y-2 overflow-auto">
+              <textarea value={draft} onChange={(e) => setDraft(e.target.value)} spellCheck={false} className="field w-full h-80 text-xs font-mono" />
+              {jsonErr && <p className="text-xs text-destructive">{jsonErr}</p>}
+            </div>
+          ) : (
+            <pre className="overflow-auto p-4 text-xs text-primary">{json}</pre>
+          )}
         </Modal>
       )}
 
